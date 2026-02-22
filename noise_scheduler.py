@@ -72,18 +72,21 @@ def sample_noise(shape: tuple, noise_type: NoiseType, device: torch.device) -> t
 
     elif noise_type == "laplace":
         # Laplace(0, 1/sqrt(2)) hat Varianz 1  (wie N(0,1))
+        # WICHTIG: u darf nicht genau ±0.5 sein → log1p(-2*|u|) = log(0) = -inf → NaN
         u = torch.rand(shape, device=device) - 0.5
-        return -(1.0 / math.sqrt(2)) * u.sign() * torch.log1p(-2 * u.abs())
+        u = u.clamp(-0.4999, 0.4999)   # numerisch sicher
+        return -(1.0 / math.sqrt(2)) * u.sign() * torch.log1p(-2.0 * u.abs())
 
     elif noise_type == "mixed":
         # Batch-weise zufällig Gauß oder Laplace
         B = shape[0]
-        gaussian = torch.randn(shape, device=device)
-        laplace_u = torch.rand(shape, device=device) - 0.5
-        laplace = -(1.0 / math.sqrt(2)) * laplace_u.sign() * torch.log1p(-2 * laplace_u.abs())
+        gaussian  = torch.randn(shape, device=device)
+        laplace_u = (torch.rand(shape, device=device) - 0.5).clamp(-0.4999, 0.4999)
+        laplace   = -(1.0 / math.sqrt(2)) * laplace_u.sign() * torch.log1p(-2.0 * laplace_u.abs())
         # Maske: 50 % Gauß, 50 % Laplace pro Batch-Element
         mask = (torch.rand(B, *([1] * (len(shape) - 1)), device=device) > 0.5)
         return torch.where(mask, gaussian, laplace)
+
 
     else:
         raise ValueError(f"Unbekannter noise_type '{noise_type}'. Wähle 'gaussian', 'laplace' oder 'mixed'.")
