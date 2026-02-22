@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.env
+.venv/
+env/
+venv/
+
+# Checkpoints & Outputs werden NICHT ignoriert
+# (checkpoints/, *.png, *.pt sind versioniert)
