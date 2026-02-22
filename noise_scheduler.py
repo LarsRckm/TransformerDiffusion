@@ -197,7 +197,7 @@ class NoiseScheduler(nn.Module):
         return x_t, noise
 
     # ------------------------------------------------------------------
-    # Training-Loss: L_simple
+    # Training-Loss: L_simple  (+  optional Glattheitsverlust)
     # ------------------------------------------------------------------
     def p_losses(
         self,
@@ -206,39 +206,65 @@ class NoiseScheduler(nn.Module):
         t: torch.Tensor,
         noise_type: NoiseType = "mixed",
         loss_type: Literal["mse", "huber"] = "huber",
-    ) -> torch.Tensor:
+        smoothness_weight: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Berechnet den Diffusion-Trainingsloss.
+        Berechnet den Diffusion-Trainingsloss (optional + Glattheitsverlust).
 
         Steps:
           1. Noise samplen
           2. x_t = q_sample(x_0, t, noise)
           3. Modell sagt Noise vorher: eps_hat = model(x_t, t)
-          4. Loss zwischen eps und eps_hat
+          4. L_noise  = loss(eps_hat, noise)
+          5. x̂_0     = (x_t - √(1-ᾱ_t)·ε̂) / √ᾱ_t       [Rekonstruktion]
+          6. L_smooth = ||Δ¹x̂_0||² + ||Δ²x̂_0||²         [1.+2. Ableitung]
+          7. L_total  = L_noise + smoothness_weight · L_smooth
 
         Parameters
         ----------
-        model      : DiffusionTransformer Instanz.
-        x_0        : Saubere Zeitreihe (B, L, 1).
-        t          : Schritt-Indizes (B,).
-        noise_type : "gaussian", "laplace" oder "mixed".
-        loss_type  : "mse" (L2) oder "huber" (robust gegen Ausreißer).
+        model             : DiffusionTransformer Instanz.
+        x_0               : Saubere Zeitreihe (B, L, 1).
+        t                 : Schritt-Indizes (B,).
+        noise_type        : "gaussian", "laplace" oder "mixed".
+        loss_type         : "mse" (L2) oder "huber" (robust gegen Ausreißer).
+        smoothness_weight : Gewicht für den Glattheitsverlust (0 = aus).
 
         Returns
         -------
-        Skalar-Loss.
+        (total_loss, noise_loss, smooth_loss)  – alle als Skalare.
         """
         x_t, noise = self.q_sample(x_0, t, noise_type=noise_type)
 
         # Modell sagt Rauschen vorher
         eps_hat = model(x_t, t)       # (B, L, 1)
 
+        # --- Rausch-Loss ---
         if loss_type == "mse":
-            return F.mse_loss(eps_hat, noise)
+            loss_noise = F.mse_loss(eps_hat, noise)
         elif loss_type == "huber":
-            return F.huber_loss(eps_hat, noise, delta=1.0)
+            loss_noise = F.huber_loss(eps_hat, noise, delta=1.0)
         else:
             raise ValueError(f"Unbekannter loss_type '{loss_type}'.")
+
+        # --- Glattheitsverlust auf x̂_0 ---
+        if smoothness_weight > 0.0:
+            # x̂_0 aus ε̂ rekonstruieren  (tweedie formula)
+            sqrt_ab  = self._extract(self.sqrt_alphas_cumprod,           t, x_t.shape)
+            sqrt_1ab = self._extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)
+            x0_pred  = (x_t - sqrt_1ab * eps_hat) / (sqrt_ab + 1e-8)   # (B, L, 1)
+            x0_pred  = x0_pred.clamp(-2.0, 2.0)                          # numerisch begrenzen
+
+            # 1. finite Differenz  (B, L-1, 1)
+            d1   = x0_pred[:, 1:, :] - x0_pred[:, :-1, :]
+            # 2. finite Differenz  (B, L-2, 1)
+            d2   = d1[:, 1:, :] - d1[:, :-1, :]
+
+            loss_smooth = d1.pow(2).mean() + d2.pow(2).mean()
+        else:
+            loss_smooth = torch.zeros(1, device=x_t.device)
+
+        total_loss = loss_noise + smoothness_weight * loss_smooth
+        return total_loss, loss_noise, loss_smooth
 
     # ------------------------------------------------------------------
     # Reverse Process: ein Schritt p(x_{t-1} | x_t)  (DDPM)

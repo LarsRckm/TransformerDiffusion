@@ -53,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed",        type=int,   default=42,       help="Zufallsseed")
 
     # Modell
-    parser.add_argument("--d_model",    type=int,   default=128,      help="Modell-Dimension")
+    parser.add_argument("--d_model",    type=int,   default=128,      help="d-Dimension")
     parser.add_argument("--nhead",      type=int,   default=8,        help="Attention-Heads")
     parser.add_argument("--num_layers", type=int,   default=4,        help="Transformer-Blöcke")
     parser.add_argument("--dim_ffn",    type=int,   default=512,      help="FFN Hidden-Dim")
@@ -65,6 +65,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--schedule",   type=str,   default="cosine", choices=["linear", "cosine"])
     parser.add_argument("--noise_type", type=str,   default="mixed",  choices=["gaussian", "laplace", "mixed"])
     parser.add_argument("--loss_type",  type=str,   default="huber",  choices=["mse", "huber"])
+    parser.add_argument("--smoothness_weight", type=float, default=0.05,
+                        help="Gewicht des Glattheitsverlust-Terms (0=aus). Typisch: 0.01-0.1")
+    parser.add_argument("--t_bias",     type=str,   default="uniform",
+                        choices=["uniform", "low", "verylow"],
+                        help=("t-Sampling-Strategie:\n"
+                              "  uniform  – gleichverteilt [0, T)  (Standard)\n"
+                              "  low      – Bias auf [0, T/4)      (Fine-Tuning)\n"
+                              "  verylow  – Bias auf [0, T/10)     (Micro Fine-Tuning)"))
 
     # Training
     parser.add_argument("--epochs",     type=int,   default=100,      help="Trainings-Epochen")
@@ -75,7 +83,7 @@ def parse_args() -> argparse.Namespace:
     # Ausgabe
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Checkpoint-Ordner")
     parser.add_argument("--save_every",     type=int, default=10,  help="Checkpoint alle N Epochen")
-    parser.add_argument("--resume",         type=str, default=None, help="Checkpoint zum Fortsetzen")
+    parser.add_argument("--resume",         type=str, default=None, help="Checkpoint zum Fortsetzen (checkpoints/best.pt)")
 
     # Monitoring
     parser.add_argument("--preview_every", type=int, default=10,
@@ -93,6 +101,24 @@ def parse_args() -> argparse.Namespace:
 # Training – eine Epoche
 # ---------------------------------------------------------------------------
 
+def _sample_t(B: int, T: int, t_bias: str, device: torch.device) -> torch.Tensor:
+    """
+    Sampelt Diffusionsschritte t gemäß der gewählten Strategie.
+
+    uniform  : t ~ U[0, T)          – alle Niveau gleich gewichtet
+    low      : t ~ U[0, T//4)       – Fokus auf leichtes Rauschen (Fine-Tuning)
+    verylow  : t ~ U[0, T//10)      – Fokus auf minimales Rauschen (Micro Fine-Tuning)
+    """
+    if t_bias == "uniform":
+        return torch.randint(0, T, (B,), device=device)
+    elif t_bias == "low":
+        return torch.randint(0, max(T // 4, 1), (B,), device=device)
+    elif t_bias == "verylow":
+        return torch.randint(0, max(T // 10, 1), (B,), device=device)
+    else:
+        raise ValueError(f"Unbekannter t_bias: {t_bias!r}")
+
+
 def train_one_epoch(
     model:     DiffusionTransformer,
     scheduler: NoiseScheduler,
@@ -100,28 +126,31 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device:    torch.device,
     args:      argparse.Namespace,
-) -> tuple[float, float]:
+) -> tuple[float, float, float, float]:
     """
     Trainiert das Modell für eine Epoche.
 
     Returns
     -------
-    (mean_loss, mean_grad_norm)
+    (mean_total_loss, mean_noise_loss, mean_smooth_loss, mean_grad_norm)
     """
     model.train()
-    total_loss      = 0.0
-    total_grad_norm = 0.0
+    total_loss        = 0.0
+    total_noise_loss  = 0.0
+    total_smooth_loss = 0.0
+    total_grad_norm   = 0.0
 
     for batch in loader:
         x_clean = batch["x_clean"].to(device).unsqueeze(-1)  # (B, L, 1)
         B = x_clean.shape[0]
 
-        t = torch.randint(0, args.T, (B,), device=device)
+        t = _sample_t(B, args.T, args.t_bias, device)
 
-        loss = scheduler.p_losses(
+        loss, loss_noise, loss_smooth = scheduler.p_losses(
             model, x_clean, t,
             noise_type=args.noise_type,
             loss_type=args.loss_type,
+            smoothness_weight=args.smoothness_weight,
         )
 
         optimizer.zero_grad()
@@ -138,11 +167,13 @@ def train_one_epoch(
             nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
         optimizer.step()
-        total_loss      += loss.item()
-        total_grad_norm += grad_norm
+        total_loss        += loss.item()
+        total_noise_loss  += loss_noise.item()
+        total_smooth_loss += loss_smooth.item() if isinstance(loss_smooth, torch.Tensor) else float(loss_smooth)
+        total_grad_norm   += grad_norm
 
     n = len(loader)
-    return total_loss / n, total_grad_norm / n
+    return total_loss / n, total_noise_loss / n, total_smooth_loss / n, total_grad_norm / n
 
 
 # ---------------------------------------------------------------------------
@@ -175,13 +206,14 @@ def validate(
     for batch in loader:
         x_clean = batch["x_clean"].to(device).unsqueeze(-1)  # (B, L, 1)
         B = x_clean.shape[0]
-        t = torch.randint(0, args.T, (B,), device=device)
+        t = _sample_t(B, args.T, args.t_bias, device)
 
         # Gesamt-Loss
-        loss = scheduler.p_losses(
+        loss, _, _ = scheduler.p_losses(
             model, x_clean, t,
             noise_type=args.noise_type,
             loss_type=args.loss_type,
+            smoothness_weight=args.smoothness_weight,
         )
         total_loss += loss.item()
 
@@ -229,10 +261,11 @@ def save_denoising_preview(
     Erzeugt eine Denoising-Vorschau für 3 feste Rausch-Niveaus und speichert
     den Plot als PNG im Checkpoint-Ordner.
 
-    Zeigt pro Rausch-Level:
-        - Sauberer Trend (Ground Truth)
-        - Verrauschte Eingabe
-        - Modell-Ausgabe (extrahierter Trend, DDIM 20 Schritte)
+    Spalten pro Rausch-Level:
+        1. Sauberer Trend (Ground Truth)
+        2. Verrauschte Eingabe
+        3. Extrahierter Trend (DDIM 20 Schritte) + Fehler-Shading
+        4. Änderungsrate (1. Ableitung): Ground Truth vs. Extraktion
     """
     model.eval()
     rng = np.random.default_rng(seed)
@@ -240,27 +273,36 @@ def save_denoising_preview(
     x_clean    = torch.tensor(x_clean_np, dtype=torch.float32, device=device)
     x_clean    = x_clean.unsqueeze(0).unsqueeze(-1)  # (1, L, 1)
 
-    t_levels = [
-        int(args.T * 0.25),   # 25% – leichtes Rauschen
-        int(args.T * 0.50),   # 50% – mittleres Rauschen
-        int(args.T * 0.90),   # 90% – starkes Rauschen
+    t_levels     = [
+        int(args.T * 0.25),
+        int(args.T * 0.50),
+        int(args.T * 0.90),
     ]
-    level_names = ["25 %", "50 %", "90 %"]
+    level_names  = ["25 %", "50 %", "90 %"]
+    n_cols       = 4
 
     t_axis = np.arange(args.seq_len)
-    fig, axes = plt.subplots(len(t_levels), 3, figsize=(14, 3.5 * len(t_levels)))
+    t_diff = t_axis[:-1]   # x-Achse für die Ableitung (L-1 Punkte)
+
+    fig, axes = plt.subplots(len(t_levels), n_cols,
+                             figsize=(5.5 * n_cols, 3.5 * len(t_levels)))
     fig.suptitle(
         f"Denoising-Vorschau – Epoche {epoch + 1} | {args.preview_trend}",
         fontsize=12, fontweight="bold",
     )
 
-    col_labels = ["Ground Truth", "Verrauscht (Eingabe)", "Extrahierter Trend"]
+    col_labels = [
+        "Ground Truth",
+        "Verrauscht (Eingabe)",
+        "Extrahierter Trend",
+        "Änderungsrate (Δ¹)",
+    ]
     for col, lbl in enumerate(col_labels):
         axes[0, col].set_title(lbl, fontsize=10, fontweight="bold")
 
     for row, (t_lvl, t_name) in enumerate(zip(t_levels, level_names)):
         # Forward-Prozess
-        t_tensor = torch.full((1,), t_lvl, device=device, dtype=torch.long)
+        t_tensor   = torch.full((1,), t_lvl, device=device, dtype=torch.long)
         x_noisy, _ = scheduler.q_sample(x_clean, t_tensor, noise_type="gaussian")
 
         # Reverse: DDIM (schnell, 20 Schritte)
@@ -268,24 +310,42 @@ def save_denoising_preview(
             model, x_noisy, ddim_steps=20, eta=0.0, start_t=t_lvl
         )
 
-        x_c = x_clean.squeeze().cpu().numpy()
-        x_n = x_noisy.squeeze().cpu().numpy()
-        x_d = x_denoised.squeeze().cpu().numpy()
-        mse = float(np.mean((x_c - x_d) ** 2))
+        x_c  = x_clean.squeeze().cpu().numpy()
+        x_n  = x_noisy.squeeze().cpu().numpy()
+        x_d  = x_denoised.squeeze().cpu().numpy()
+        mse  = float(np.mean((x_c - x_d) ** 2))
 
-        axes[row, 0].plot(t_axis, x_c, color="tab:blue",   lw=1.5)
+        # 1. Ableitungen (finite Differenz)
+        d_truth = np.diff(x_c)   # (L-1,)
+        d_pred  = np.diff(x_d)   # (L-1,)
+
+        # --- Spalte 0: Ground Truth ---
+        axes[row, 0].plot(t_axis, x_c, color="tab:blue", lw=1.5)
         axes[row, 0].set_ylabel(f"t={t_lvl}\n({t_name})", fontsize=9)
 
+        # --- Spalte 1: Verrauscht ---
         axes[row, 1].plot(t_axis, x_n, color="tab:orange", lw=0.8, alpha=0.7)
         axes[row, 1].plot(t_axis, x_c, color="tab:blue",   lw=1.0, alpha=0.3)
 
-        axes[row, 2].plot(t_axis, x_c, color="tab:blue",   lw=1.0, alpha=0.4, label="Truth")
-        axes[row, 2].plot(t_axis, x_d, color="tab:green",  lw=1.5, label=f"MSE={mse:.5f}")
+        # --- Spalte 2: Extraktion ---
+        axes[row, 2].plot(t_axis, x_c, color="tab:blue",  lw=1.0, alpha=0.4, label="Truth")
+        axes[row, 2].plot(t_axis, x_d, color="tab:green", lw=1.5, label=f"MSE={mse:.5f}")
         axes[row, 2].fill_between(t_axis, x_c, x_d, alpha=0.2, color="red")
         axes[row, 2].legend(fontsize=7, loc="upper right")
 
-        for col in range(3):
-            axes[row, col].set_ylim(-1.5, 1.5)
+        # --- Spalte 3: Ableitung ---
+        axes[row, 3].plot(t_diff, d_truth, color="tab:blue",  lw=1.0, alpha=0.7, label="Truth Δ¹")
+        axes[row, 3].plot(t_diff, d_pred,  color="tab:green", lw=1.2, alpha=0.9, label="Pred Δ¹")
+        axes[row, 3].axhline(0, color="gray", lw=0.5, ls="--")
+        axes[row, 3].fill_between(t_diff, d_truth, d_pred, alpha=0.15, color="red")
+        axes[row, 3].legend(fontsize=7, loc="upper right")
+
+        # y-Achsen setzen
+        d_max = max(np.abs(d_truth).max(), np.abs(d_pred).max()) * 1.3 + 1e-4
+        axes[row, 3].set_ylim(-d_max, d_max)
+
+        for col in range(n_cols):
+            axes[row, col].set_ylim(-1.5, 1.5) if col < 3 else None
             axes[row, col].grid(True, alpha=0.3)
             if row == len(t_levels) - 1:
                 axes[row, col].set_xlabel("Zeitschritt")
@@ -469,13 +529,13 @@ def main():
         f"t=[{b * (args.T // args.n_t_buckets)}, {(b+1) * (args.T // args.n_t_buckets)})"
         for b in range(args.n_t_buckets)
     )
-    print(f"{'Epoche':>8} | {'Train':>10} | {'Val':>10} | {'GradNorm':>9} | {bucket_headers}")
-    print("-" * (50 + 20 * args.n_t_buckets))
+    print(f"{'Epoche':>8} | {'Train':>10} | {'L_noise':>10} | {'L_smooth':>10} | {'Val':>10} | {'GradNorm':>9} | {bucket_headers}")
+    print("-" * (70 + 20 * args.n_t_buckets))
 
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
 
-        train_loss, grad_norm = train_one_epoch(
+        train_loss, train_noise, train_smooth, grad_norm = train_one_epoch(
             model, scheduler, train_loader, optimizer, device, args
         )
         val_loss, b_losses = validate(model, scheduler, val_loader, device, args)
@@ -491,8 +551,8 @@ def main():
 
         bucket_str = " | ".join(f"{bl:10.6f}" for bl in b_losses)
         print(
-            f"{epoch+1:8d} | {train_loss:10.6f} | {val_loss:10.6f} | "
-            f"{grad_norm:9.4f} | {bucket_str}  [{elapsed:.1f}s, lr={lr_now:.1e}]"
+            f"{epoch+1:8d} | {train_loss:10.6f} | {train_noise:10.6f} | {train_smooth:10.6f} | "
+            f"{val_loss:10.6f} | {grad_norm:9.4f} | {bucket_str}  [{elapsed:.1f}s, lr={lr_now:.1e}]"
         )
 
         # Bestes Modell
