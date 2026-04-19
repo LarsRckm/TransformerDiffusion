@@ -117,7 +117,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int,   default=64,       help="Batch-Größe")
     parser.add_argument("--lr",         type=float, default=1e-4,     help="Lernrate")
     parser.add_argument("--eta_min",    type=float, default=1e-6,     help="Min. Lernrate (Cosine)")
-    parser.add_argument("--warmup_epochs", type=int, default=0,
+    parser.add_argument("--warmup_epochs", type=int, default=10,
                         help="Warmup-Epochen (0=aus). Linear auf --lr, dann Cosine.")
     parser.add_argument("--grad_clip",  type=float, default=1.0,      help="Gradient Clipping (0 = aus)")
     parser.add_argument("--early_stop_patience", type=int, default=0,
