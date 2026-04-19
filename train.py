@@ -57,11 +57,11 @@ def parse_args() -> argparse.Namespace:
                         help="Erzeugt Trainingsdaten on-the-fly (kein Pregenerate im RAM).")
 
     # Modell
-    parser.add_argument("--d_model",    type=int,   default=128,      help="d-Dimension")
+    parser.add_argument("--d_model",    type=int,   default=256,      help="d-Dimension")
     parser.add_argument("--nhead",      type=int,   default=8,        help="Attention-Heads")
     parser.add_argument("--num_layers", type=int,   default=4,        help="Transformer-Blöcke")
-    parser.add_argument("--dim_ffn",    type=int,   default=512,      help="FFN Hidden-Dim")
-    parser.add_argument("--time_emb",   type=int,   default=128,      help="Time-Embedding-Dim")
+    parser.add_argument("--dim_ffn",    type=int,   default=1024,      help="FFN Hidden-Dim")
+    parser.add_argument("--time_emb",   type=int,   default=256,      help="Time-Embedding-Dim")
     parser.add_argument("--dropout",    type=float, default=0.1,      help="Dropout")
 
     # Noise Scheduler
@@ -120,6 +120,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup_epochs", type=int, default=0,
                         help="Warmup-Epochen (0=aus). Linear auf --lr, dann Cosine.")
     parser.add_argument("--grad_clip",  type=float, default=1.0,      help="Gradient Clipping (0 = aus)")
+    parser.add_argument("--early_stop_patience", type=int, default=0,
+                        help="Early stopping: stoppt, wenn Val-Loss fuer N Epochen nicht verbessert (0=aus).")
+    parser.add_argument("--early_stop_min_delta", type=float, default=0.0,
+                        help="Minimaler Val-Loss-Abstand fuer eine Verbesserung (Early stopping).")
 
     # Ausgabe
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Checkpoint-Ordner")
@@ -734,9 +738,11 @@ def main():
     # --- Checkpoint fortsetzen ---
     start_epoch   = 0
     best_val_loss = math.inf
+    epochs_since_best = 0
     if args.resume is not None:
         start_epoch, best_val_loss = load_checkpoint(args.resume, model, sigma_estimator, optimizer)
         start_epoch += 1
+        epochs_since_best = 0
 
     # --- Training ---
     print(f"\nStarte Training für {args.epochs} Epochen ...\n")
@@ -814,11 +820,23 @@ def main():
             f"{val_loss:10.6f} | {grad_norm:9.4f} | {bucket_str}  [{elapsed:.1f}s, lr={lr_now:.1e}]"
         )
 
-        # Bestes Modell
-        if val_loss < best_val_loss:
+        # Bestes Modell + Early stopping
+        improved_for_patience = val_loss < (best_val_loss - float(args.early_stop_min_delta))
+        if improved_for_patience:
             best_val_loss = val_loss
+            epochs_since_best = 0
             save_checkpoint(model, sigma_estimator, optimizer, epoch, val_loss, args, ckpt_dir / "best.pt")
             print(f"  ★ Bestes Modell gespeichert (Val-Loss: {val_loss:.6f})")
+        else:
+            epochs_since_best += 1
+
+        if args.early_stop_patience and args.early_stop_patience > 0:
+            if epochs_since_best >= int(args.early_stop_patience):
+                print(
+                    f"\nEarly stopping: keine Verbesserung fuer {args.early_stop_patience} Epochen "
+                    f"(best Val-Loss={best_val_loss:.6f}). Stoppe Training.\n"
+                )
+                break
 
         # Regelmäßige Checkpoints
         if (epoch + 1) % args.save_every == 0:
