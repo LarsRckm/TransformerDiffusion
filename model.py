@@ -223,8 +223,12 @@ class TransformerBlock(nn.Module):
 
 class DiffusionTransformer(nn.Module):
     """
-    Transformer-Modell, das bei gegebener verrauschter Zeitreihe x_t
-    und Schritt t das addierte Rauschen ε vorhersagt.
+    Transformer-Modell fuer Diffusion-Denoising.
+
+    Das Modell kann konditioniert betrieben werden: neben x_t und t kann eine
+    beobachtete Zeitreihe y_obs (verrauscht und ggf. maskiert) sowie eine Maske
+    mask (1=beobachtet, 0=fehlend) uebergeben werden. Optional kann zudem
+    log(sigma) als Konditionierung eingespeist werden.
 
     Aufbau:
         (B, L, 1)  →  Feature Projection  →  (B, L, d_model)
@@ -253,6 +257,7 @@ class DiffusionTransformer(nn.Module):
         dim_feedforward: int = 512,
         time_emb_dim: int = 128,
         dropout: float = 0.1,
+        in_channels: int = 3,
     ):
         super().__init__()
         self.seq_len   = seq_len
@@ -267,8 +272,18 @@ class DiffusionTransformer(nn.Module):
             nn.Linear(time_emb_dim * 4, time_emb_dim),
         )
 
-        # --- Feature Projection: 1D → d_model ---
-        self.input_proj = nn.Linear(1, d_model)
+        # --- Feature Projection: in_channels → d_model ---
+        # Standard: [x_t, y_obs, mask]
+        self.in_channels = in_channels
+        self.input_proj = nn.Linear(in_channels, d_model)
+
+        # --- Sigma-Conditioning (optional) ---
+        # log(sigma) wird als zusaetzliche Konditionierung in das Time-Embedding addiert.
+        self.sigma_proj = nn.Sequential(
+            nn.Linear(1, time_emb_dim * 4),
+            nn.SiLU(),
+            nn.Linear(time_emb_dim * 4, time_emb_dim),
+        )
 
         # --- Positional Encoding ---
         self.pos_enc = PositionalEncoding(d_model, max_len=seq_len + 64, dropout=dropout)
@@ -304,6 +319,9 @@ class DiffusionTransformer(nn.Module):
         self,
         x_t: torch.Tensor,     # (B, L, 1)  verrauschte Zeitreihe
         t: torch.Tensor,        # (B,)       Diffusionsschritt
+        y_obs: Optional[torch.Tensor] = None,   # (B, L, 1)
+        mask: Optional[torch.Tensor] = None,    # (B, L, 1)  1=observed, 0=missing
+        sigma_log: Optional[torch.Tensor] = None,  # (B,) log(sigma) in model space
     ) -> torch.Tensor:
         """
         Parameters
@@ -315,12 +333,21 @@ class DiffusionTransformer(nn.Module):
         -------
         eps_hat : (B, L, 1) – Vorhergesagtes Rauschen ε̂.
         """
-        # 1. Time Embedding
+        # 1. Time Embedding (+ optional sigma conditioning)
         t_emb = self.time_embedding(t)    # (B, time_emb_dim)
         t_emb = self.time_proj(t_emb)     # (B, time_emb_dim)
+        if sigma_log is not None:
+            t_emb = t_emb + self.sigma_proj(sigma_log.float().unsqueeze(-1))
 
-        # 2. Feature Projection + Positional Encoding
-        x = self.input_proj(x_t)          # (B, L, d_model)
+        # 2. Conditioning Defaults (Legacy-Aufrufe)
+        if y_obs is None:
+            y_obs = torch.zeros_like(x_t)
+        if mask is None:
+            mask = torch.ones_like(x_t)
+
+        # 3. Feature Projection + Positional Encoding
+        inp = torch.cat([x_t, y_obs, mask], dim=-1)  # (B, L, in_channels)
+        x = self.input_proj(inp)          # (B, L, d_model)
         x = self.pos_enc(x)               # (B, L, d_model)
 
         # 3. Transformer Blocks
@@ -336,6 +363,40 @@ class DiffusionTransformer(nn.Module):
     def count_parameters(self) -> int:
         """Gibt die Anzahl trainierbarer Parameter zurück."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class SigmaEstimator(nn.Module):
+    """Schätzt log(sigma) aus (y_obs, mask) pro Sample.
+
+    Input:
+        y_obs : (B, L, 1)
+        mask  : (B, L, 1)
+    Output:
+        log_sigma_hat : (B,)
+    """
+
+    def __init__(self, hidden: int = 32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(2, hidden, kernel_size=5, padding=2),
+            nn.SiLU(),
+            nn.Conv1d(hidden, hidden, kernel_size=5, padding=2),
+            nn.SiLU(),
+            nn.Conv1d(hidden, hidden, kernel_size=3, padding=1),
+            nn.SiLU(),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, y_obs: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([y_obs, mask], dim=-1)  # (B, L, 2)
+        x = x.transpose(1, 2)                 # (B, 2, L)
+        h = self.net(x)                       # (B, hidden, L)
+        h = h.mean(dim=-1)                    # (B, hidden)
+        return self.head(h).squeeze(-1)       # (B,)
 
 
 # ---------------------------------------------------------------------------

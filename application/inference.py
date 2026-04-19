@@ -34,7 +34,12 @@ Aufruf:
 """
 
 import argparse
+import os
+import sys
 from pathlib import Path
+
+# Fix module imports by adding parent directory to sys.path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -56,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     # --- Checkpoint & Modell ---
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/best.pt",
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/epoch_0600.pt",
                         help="Pfad zum Modell-Checkpoint")
 
     # --- Inferenz-Modus ---
@@ -70,7 +75,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     # --- Sampling-Methode ---
-    parser.add_argument("--method", type=str, default="ddim",
+    parser.add_argument("--method", type=str, default="ddpm",
                         choices=["ddpm", "ddim"],
                         help="Sampling-Algorithmus: ddpm (stochastisch) oder ddim (deterministisch)")
     parser.add_argument("--ddim_steps", type=int, default=50,
@@ -89,7 +94,7 @@ def parse_args() -> argparse.Namespace:
                         help="Art des Rauschens beim Forward-Prozess (nur partial-Modus)")
 
     # --- Daten ---
-    parser.add_argument("--seq_len",    type=int, default=256)
+    parser.add_argument("--seq_len",    type=int, default=1000)
     parser.add_argument("--n_examples", type=int, default=3,
                         help="Anzahl Beispiele pro Trendtyp im Demo-Plot")
     parser.add_argument("--seed",       type=int, default=0)
@@ -114,7 +119,7 @@ def load_model(checkpoint_path: str, device: torch.device) -> tuple[DiffusionTra
     saved_args = state.get("args", {})
 
     model = DiffusionTransformer(
-        seq_len=saved_args.get("seq_len", 256),
+        seq_len=saved_args.get("seq_len", 1000),
         d_model=saved_args.get("d_model", 128),
         nhead=saved_args.get("nhead", 8),
         num_layers=saved_args.get("num_layers", 4),

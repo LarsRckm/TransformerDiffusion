@@ -14,4 +14,6 @@ env/
 venv/
 
 # Checkpoints & Outputs werden NICHT ignoriert
-# (checkpoints/, *.png, *.pt sind versioniert)
+checkpoints/, 
+*.png, 
+*.pt

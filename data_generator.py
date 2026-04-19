@@ -3,12 +3,20 @@ data_generator.py
 =================
 Synthetischer Daten-Generator für Trendextraktion mit Diffusion-Modellen.
 
-Erzeugt vier Trend-Typen:
-  - slow_trend:       Langsam ändernde Trends (Polynom niedriger Ordnung ODER
-                      iterativer Random-Walk + Spline-Glättung)
-  - periodic:         Einzelne Sinus/Cosinus-Welle
-  - multi_periodic:   Überlagerung mehrerer Sinuswellen (Fourier-Stil)
-  - discontinuous:    Trends mit Sprüngen oder plötzlichen Steigungsänderungen
+Trend-Typen (Basis):
+  - slow_trend:           Langsam ändernde Trends (Polynom niedriger Ordnung ODER
+                          iterativer Random-Walk + Spline-Glättung)
+  - periodic:             Einzelne Sinus/Cosinus-Welle
+  - multi_periodic:       Überlagerung mehrerer Sinuswellen (Fourier-Stil)
+  - discontinuous:        Trends mit Sprüngen oder plötzlichen Steigungsänderungen
+
+Erweiterte Trend-Typen:
+  - exponential_decay:    Exponentiell ab- oder ansteigende Kurve (mit/ohne Offset)
+  - chirp:                Sinuswelle mit linear ansteigender Frequenz (Frequenz-Sweep)
+  - damped_oscillation:   Gedämpfte Sinusschwingung (exponentieller Envelope)
+  - logistic_growth:      S-förmige Wachstumskurve (Logistisch / Sigmoid)
+  - sawtooth_wave:        Sägezahn-artiger periodischer Trend
+  - random_walk_trend:    Gefilterte Brownsche Bewegung (glatter als slow_trend walk)
 
 Alle Trends werden auf [-1, 1] normalisiert, bevor Rauschen hinzugefügt wird.
 """
@@ -24,7 +32,11 @@ from typing import Literal, Optional
 # Trend-Generierungsfunktionen
 # ---------------------------------------------------------------------------
 
-TrendType = Literal["slow_trend", "periodic", "multi_periodic", "discontinuous"]
+TrendType = Literal[
+    "slow_trend", "periodic", "multi_periodic", "discontinuous",
+    "exponential_decay", "chirp", "damped_oscillation",
+    "logistic_growth", "sawtooth_wave", "random_walk_trend",
+]
 
 
 def generate_slow_trend(length: int, rng: np.random.Generator) -> np.ndarray:
@@ -133,6 +145,153 @@ def generate_discontinuous(length: int, rng: np.random.Generator) -> np.ndarray:
     return signal
 
 
+# ---------------------------------------------------------------------------
+# Erweiterte Trend-Generatoren
+# ---------------------------------------------------------------------------
+
+def generate_exponential_decay(length: int, rng: np.random.Generator) -> np.ndarray:
+    """
+    Exponentiell ab- oder ansteigende Kurve, gelegentlich mit überlagerten
+    Sinusschwingungen oder einem konstanten Offset.
+
+    Varianten (zufällig gewählt):
+      - "decay"   : Exponentieller Abfall,  f(t) = A · exp(-λ·t) + c
+      - "growth"  : Exponentielles Wachstum, f(t) = A · exp(+λ·t) + c
+      - "mixed"   : Abfall + leichte Überlagerung einer langsamen Schwingung
+    """
+    t = np.linspace(0.0, 1.0, length)
+    variant = rng.choice(["decay", "growth", "mixed"])
+    lam = rng.uniform(2.0, 8.0)          # Abklingkonstante
+    A   = rng.uniform(0.5, 2.0) * rng.choice([-1.0, 1.0])
+    c   = rng.uniform(-0.5, 0.5)        # Offset
+
+    if variant == "decay":
+        signal = A * np.exp(-lam * t) + c
+    elif variant == "growth":
+        signal = A * np.exp(lam * (t - 1.0)) + c   # von links: klein → groß
+    else:  # mixed
+        signal = A * np.exp(-lam * t) + c
+        freq   = rng.uniform(1.0, 3.0)
+        signal += 0.3 * np.sin(2 * np.pi * freq * t + rng.uniform(0, 2 * np.pi))
+    return signal
+
+
+def generate_chirp(length: int, rng: np.random.Generator) -> np.ndarray:
+    """
+    Frequenz-Sweep (Chirp): Sinuswelle, deren Frequenz linear von f_start
+    nach f_end ansteigt (oder abfällt). Erzeugt ein zeitlich variierendes
+    Muster, das sich fundamental von stationären Schwingungen unterscheidet.
+
+    f(t) = A · sin(2π · (f_start·t + 0.5·(f_end - f_start)·t²) + φ)
+    """
+    t      = np.linspace(0.0, 1.0, length)
+    f_start = rng.uniform(0.5, 3.0)
+    f_end   = rng.uniform(5.0, 20.0)
+    if rng.random() > 0.5:               # Manchmal von hoch nach niedrig
+        f_start, f_end = f_end, f_start
+    A     = rng.uniform(0.6, 1.5)
+    phase = rng.uniform(0.0, 2 * np.pi)
+    inst_phase = 2 * np.pi * (f_start * t + 0.5 * (f_end - f_start) * t ** 2)
+    return A * np.sin(inst_phase + phase)
+
+
+def generate_damped_oscillation(length: int, rng: np.random.Generator) -> np.ndarray:
+    """
+    Gedämpfte Sinusschwingung:
+      f(t) = A · exp(-γ·t) · sin(2π·f·t + φ)
+
+    Der exponentielle Envelope sorgt dafür, dass die Amplitude mit der Zeit
+    abnimmt – ein Muster, das in vielen physikalischen Systemen auftritt.
+    Gelegentlich wird der Onset verzögert (Signal startet mit einer Rampe).
+    """
+    t = np.linspace(0.0, 1.0, length)
+    A     = rng.uniform(0.8, 2.0)
+    gamma = rng.uniform(2.0, 8.0)   # Dämpfungskonstante
+    freq  = rng.uniform(2.0, 10.0)
+    phase = rng.uniform(0.0, 2 * np.pi)
+
+    envelope = np.exp(-gamma * t)
+    signal   = A * envelope * np.sin(2 * np.pi * freq * t + phase)
+
+    # Optionaler positiver Onset-Offset
+    if rng.random() > 0.5:
+        signal += rng.uniform(-0.5, 0.5)
+    return signal
+
+
+def generate_logistic_growth(length: int, rng: np.random.Generator) -> np.ndarray:
+    """
+    S-förmige Wachstumskurve (Logistisch / Sigmoid):
+      f(t) = L / (1 + exp(-k·(t - t0))) + c
+
+    Parameter:
+      L  : Sättigungswert
+      k  : Wachstumsrate
+      t0 : Wendepunkt (Mitte des Übergangs)
+      c  : Basisoffset
+
+    Manchmal gespiegelt (abfallende Kurve) oder mit einer kleinen
+    überlagerten Schwingung kombiniert.
+    """
+    t  = np.linspace(-6.0, 6.0, length)
+    L  = rng.uniform(1.5, 3.0)
+    k  = rng.uniform(0.6, 2.5)
+    t0 = rng.uniform(-2.0, 2.0)
+    c  = rng.uniform(-0.3, 0.3)
+
+    signal = L / (1.0 + np.exp(-k * (t - t0))) + c
+    if rng.random() > 0.5:
+        signal = -signal + signal.mean() * 2   # spiegeln
+    return signal
+
+
+def generate_sawtooth_wave(length: int, rng: np.random.Generator) -> np.ndarray:
+    """
+    Sägezahn-artiger periodischer Trend. Drei Varianten:
+      - "sawtooth"  : Klassisch ansteigender Sägezahn (Modulo-Funktion)
+      - "triangle"  : Dreieckswelle (aufwärts + abwärts)
+      - "asymmetric": Asymmetrischer Sägezahn mit unterschiedlicher
+                      Anstiegs- und Abfallgeschwindigkeit
+    """
+    t = np.linspace(0.0, 1.0, length)
+    variant = rng.choice(["sawtooth", "triangle", "asymmetric"])
+    freq    = rng.uniform(1.5, 6.0)   # Anzahl Perioden
+    amp     = rng.uniform(0.7, 1.5)
+
+    phase = t * freq
+    if variant == "sawtooth":
+        signal = amp * 2.0 * (phase - np.floor(phase + 0.5))
+    elif variant == "triangle":
+        p = phase % 1.0
+        signal = amp * (2.0 * np.where(p < 0.5, p, 1.0 - p) * 2.0 - 1.0)
+    else:  # asymmetric
+        duty = rng.uniform(0.2, 0.8)
+        p = phase % 1.0
+        ascending  = p / duty
+        descending = (1.0 - p) / (1.0 - duty)
+        signal = amp * np.where(p < duty, ascending, 1.0 - descending) * 2.0 - amp
+    return signal
+
+
+def generate_random_walk_trend(length: int, rng: np.random.Generator) -> np.ndarray:
+    """
+    Gefilterte Brownsche Bewegung als glatter Trend. Im Gegensatz zu
+    ``generate_slow_trend`` wird hier ausschließlich ein Random Walk
+    erzeugt, der durch einen Gauss-Filter stark geglättet wird.
+    Die Tiefpass-Bandbreite wird zufällig gewählt, sodass unterschiedlich
+    "träge" Trends entstehen.
+    """
+    from scipy.ndimage import gaussian_filter1d
+
+    steps  = rng.standard_normal(length)
+    signal = np.cumsum(steps)
+
+    # Sigma in Zeitschritten: groß → sehr glatt, klein → leicht rauer
+    sigma = rng.uniform(length * 0.03, length * 0.2)
+    signal = gaussian_filter1d(signal, sigma=sigma)
+    return signal
+
+
 def generate_trend(
     trend_type: TrendType,
     length: int = 256,
@@ -144,7 +303,9 @@ def generate_trend(
     Parameters
     ----------
     trend_type : str
-        Einer von "slow_trend", "periodic", "multi_periodic", "discontinuous".
+        Einer von: slow_trend, periodic, multi_periodic, discontinuous,
+        exponential_decay, chirp, damped_oscillation, logistic_growth,
+        sawtooth_wave, random_walk_trend.
     length : int
         Länge der Zeitreihe (default: 256).
     rng : np.random.Generator, optional
@@ -158,10 +319,17 @@ def generate_trend(
         rng = np.random.default_rng()
 
     generators = {
-        "slow_trend":    generate_slow_trend,
-        "periodic":      generate_periodic,
-        "multi_periodic": generate_multi_periodic,
-        "discontinuous": generate_discontinuous,
+        "slow_trend":         generate_slow_trend,
+        "periodic":           generate_periodic,
+        "multi_periodic":     generate_multi_periodic,
+        "discontinuous":      generate_discontinuous,
+        # --- Erweiterte Typen ---
+        "exponential_decay":  generate_exponential_decay,
+        "chirp":              generate_chirp,
+        "damped_oscillation": generate_damped_oscillation,
+        "logistic_growth":    generate_logistic_growth,
+        "sawtooth_wave":      generate_sawtooth_wave,
+        "random_walk_trend":  generate_random_walk_trend,
     }
 
     if trend_type not in generators:
@@ -186,8 +354,22 @@ def normalize(x: np.ndarray) -> np.ndarray:
 # PyTorch Dataset
 # ---------------------------------------------------------------------------
 
-ALL_TREND_TYPES: list[TrendType] = [
+# Trainings-Typen (werden vom Modell im Training gesehen)
+TRAIN_TREND_TYPES: list[TrendType] = [
     "slow_trend", "periodic", "multi_periodic", "discontinuous"
+]
+
+# Alle bekannten Typen (inkl. erweiterter Generatoren)
+ALL_TREND_TYPES: list[TrendType] = [
+    "slow_trend", "periodic", "multi_periodic", "discontinuous",
+    "exponential_decay", "chirp", "damped_oscillation",
+    "logistic_growth", "sawtooth_wave", "random_walk_trend",
+]
+
+# Nur die erweiterten (neuen) Typen
+EXTENDED_TREND_TYPES: list[TrendType] = [
+    "exponential_decay", "chirp", "damped_oscillation",
+    "logistic_growth", "sawtooth_wave", "random_walk_trend",
 ]
 
 
@@ -251,16 +433,17 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
 
     rng = np.random.default_rng(0)
-    fig, axes = plt.subplots(4, 4, figsize=(16, 10))
+    n_cols = len(ALL_TREND_TYPES)
+    fig, axes = plt.subplots(4, n_cols, figsize=(3.5 * n_cols, 12))
     fig.suptitle("Synthetische Trends (je 4 Beispiele pro Typ)", fontsize=14)
 
     for col, ttype in enumerate(ALL_TREND_TYPES):
-        axes[0, col].set_title(ttype, fontweight="bold")
+        axes[0, col].set_title(ttype, fontweight="bold", fontsize=8)
         for row in range(4):
             trend = generate_trend(ttype, length=256, rng=rng)
             axes[row, col].plot(trend, linewidth=1.2)
             axes[row, col].set_ylim(-1.2, 1.2)
-            axes[row, col].set_xlabel("Zeitschritt")
+            axes[row, col].set_xlabel("Zeitschritt", fontsize=7)
             if col == 0:
                 axes[row, col].set_ylabel(f"Beispiel {row + 1}")
 

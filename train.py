@@ -34,8 +34,10 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 
 from data_generator import TrendDataset, ALL_TREND_TYPES, generate_trend
-from model import DiffusionTransformer
+from model import DiffusionTransformer, SigmaEstimator
 from noise_scheduler import NoiseScheduler
+from masking import MaskConfig, generate_missing_mask
+from normalization import robust_normalize_masked, apply_norm
 
 
 # ---------------------------------------------------------------------------
@@ -63,10 +65,32 @@ def parse_args() -> argparse.Namespace:
     # Noise Scheduler
     parser.add_argument("--T",          type=int,   default=1000,     help="Diffusionsschritte")
     parser.add_argument("--schedule",   type=str,   default="cosine", choices=["linear", "cosine"])
-    parser.add_argument("--noise_type", type=str,   default="mixed",  choices=["gaussian", "laplace", "mixed"])
+    # Hinweis: Messrauschen wird als Gaussian erzeugt (sigma_u_max). Dieser Parameter
+    # bleibt fuer Legacy/Experimente erhalten.
+    parser.add_argument("--noise_type", type=str,   default="gaussian",  choices=["gaussian", "laplace", "mixed"])
     parser.add_argument("--loss_type",  type=str,   default="huber",  choices=["mse", "huber"])
-    parser.add_argument("--smoothness_weight", type=float, default=0.05,
+    parser.add_argument("--smoothness_weight", type=float, default=0.0,
                         help="Gewicht des Glattheitsverlust-Terms (0=aus). Typisch: 0.01-0.1")
+
+    # Measurement noise (Gaussian): sigma = u * (max(x0)-min(x0)), u ~ U[0, sigma_u_max]
+    parser.add_argument("--sigma_u_max", type=float, default=0.2,
+                        help="Max. Faktor u fuer Messrauschen: sigma=u*(max-min)")
+
+    # Imputation training
+    parser.add_argument("--impute_prob", type=float, default=0.5,
+                        help="Wahrscheinlichkeit fuer Samples mit Missingness (Interpolation)")
+    parser.add_argument("--max_missing_frac", type=float, default=0.70,
+                        help="Max. Missing-Fraction in Imputation-Samples")
+    parser.add_argument("--max_blocks", type=int, default=20,
+                        help="Max. Anzahl Missing-Bloecke")
+    parser.add_argument("--max_block_len", type=int, default=150,
+                        help="Max. Laenge eines Missing-Blocks")
+    parser.add_argument("--min_gap", type=int, default=10,
+                        help="Min. Abstand (beobachtete Punkte) zwischen Blocks")
+
+    # Sigma head loss
+    parser.add_argument("--sigma_loss_weight", type=float, default=0.05,
+                        help="Gewicht des Sigma-Schaetz-Loss")
     parser.add_argument("--t_bias",     type=str,   default="uniform",
                         choices=["uniform", "low", "verylow"],
                         help=("t-Sampling-Strategie:\n"
@@ -121,6 +145,7 @@ def _sample_t(B: int, T: int, t_bias: str, device: torch.device) -> torch.Tensor
 
 def train_one_epoch(
     model:     DiffusionTransformer,
+    sigma_estimator: SigmaEstimator,
     scheduler: NoiseScheduler,
     loader:    DataLoader,
     optimizer: torch.optim.Optimizer,
@@ -135,36 +160,93 @@ def train_one_epoch(
     (mean_total_loss, mean_noise_loss, mean_smooth_loss, mean_grad_norm)
     """
     model.train()
+    sigma_estimator.train()
     total_loss        = 0.0
     total_noise_loss  = 0.0
     total_smooth_loss = 0.0
     total_grad_norm   = 0.0
 
+    mask_cfg = MaskConfig(
+        max_missing_frac=args.max_missing_frac,
+        max_blocks=args.max_blocks,
+        min_block_len=2,
+        max_block_len=args.max_block_len,
+        min_gap=args.min_gap,
+    )
+
     for batch in loader:
-        x_clean = batch["x_clean"].to(device).unsqueeze(-1)  # (B, L, 1)
-        B = x_clean.shape[0]
+        x0_raw = batch["x_clean"].to(device).unsqueeze(-1)  # (B, L, 1)  (synthetic already normalized)
+        B = x0_raw.shape[0]
+
+        # --- Create imputation masks (50/50 by default) ---
+        # Note: mask generation uses numpy RNG; keep it simple and reproducible per-epoch by torch seed.
+        rng = np.random.default_rng(int(torch.randint(0, 2**31 - 1, (1,)).item()))
+        mask_np = np.ones((B, args.seq_len), dtype=np.float32)
+        do_impute = rng.random(B) < float(args.impute_prob)
+        for i in range(B):
+            if do_impute[i]:
+                mask_np[i] = generate_missing_mask(args.seq_len, rng, mask_cfg, enforce_missing=True)
+        mask = torch.tensor(mask_np, device=device, dtype=torch.float32).unsqueeze(-1)  # (B,L,1)
+
+        # --- Measurement noise (Gaussian) in *raw* scale ---
+        # sigma = u*(max-min) per sample
+        x0_np = x0_raw.squeeze(-1).detach().cpu().numpy()
+        amp = (x0_np.max(axis=1) - x0_np.min(axis=1))
+        u = rng.uniform(0.0, float(args.sigma_u_max), size=B)
+        sigma = (u * amp).astype(np.float32)
+        sigma_t = torch.tensor(sigma, device=device, dtype=torch.float32)  # (B,)
+        y = x0_raw + sigma_t.view(B, 1, 1) * torch.randn_like(x0_raw)
+        y_obs = y * mask
+
+        # --- Per-window robust normalization based on observed y ---
+        x0_norm_list = []
+        y_obs_norm_list = []
+        sigma_norm_list = []
+        for i in range(B):
+            y_i = y_obs[i].squeeze(-1).detach().cpu().numpy()
+            m_i = mask[i].squeeze(-1).detach().cpu().numpy()
+            y_norm_i, params = robust_normalize_masked(y_i, m_i)
+            x0_norm_i = apply_norm(x0_raw[i].squeeze(-1).detach().cpu().numpy(), params)
+            x0_norm_list.append(x0_norm_i)
+            y_obs_norm_list.append(y_norm_i * m_i)
+            sigma_norm_list.append(float(sigma[i]) * float(params.scale))
+
+        x_clean = torch.tensor(np.stack(x0_norm_list), device=device, dtype=torch.float32).unsqueeze(-1)
+        y_obs_n = torch.tensor(np.stack(y_obs_norm_list), device=device, dtype=torch.float32).unsqueeze(-1)
+        sigma_norm = torch.tensor(np.array(sigma_norm_list, dtype=np.float32), device=device)
+        sigma_log_true = torch.log(sigma_norm.clamp_min(1e-6))
+
+        # --- sigma estimate ---
+        sigma_log_hat = sigma_estimator(y_obs_n, mask)
 
         t = _sample_t(B, args.T, args.t_bias, device)
 
         loss, loss_noise, loss_smooth = scheduler.p_losses(
             model, x_clean, t,
-            noise_type=args.noise_type,
+            y_obs=y_obs_n,
+            mask=mask,
+            sigma_log=sigma_log_hat.detach(),
+            noise_type="gaussian",
             loss_type=args.loss_type,
             smoothness_weight=args.smoothness_weight,
         )
+
+        loss_sigma = F.smooth_l1_loss(sigma_log_hat, sigma_log_true)
+        loss = loss + float(args.sigma_loss_weight) * loss_sigma
 
         optimizer.zero_grad()
         loss.backward()
 
         # Gradient-Norm messen (vor dem Clipping)
+        params = list(model.parameters()) + list(sigma_estimator.parameters())
         grad_norm = sum(
             p.grad.norm().item() ** 2
-            for p in model.parameters()
+            for p in params
             if p.grad is not None
         ) ** 0.5
 
         if args.grad_clip > 0:
-            nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            nn.utils.clip_grad_norm_(params, args.grad_clip)
 
         optimizer.step()
         total_loss        += loss.item()
@@ -183,6 +265,7 @@ def train_one_epoch(
 @torch.no_grad()
 def validate(
     model:     DiffusionTransformer,
+    sigma_estimator: SigmaEstimator,
     scheduler: NoiseScheduler,
     loader:    DataLoader,
     device:    torch.device,
@@ -197,29 +280,73 @@ def validate(
         bucket_losses: Liste mit einem Loss-Wert pro Bucket (Länge n_t_buckets).
     """
     model.eval()
+    sigma_estimator.eval()
     total_loss    = 0.0
     n_buckets     = args.n_t_buckets
     bucket_size   = args.T // n_buckets
     bucket_losses = [0.0] * n_buckets
     bucket_counts = [0]   * n_buckets
 
+    mask_cfg = MaskConfig(
+        max_missing_frac=args.max_missing_frac,
+        max_blocks=args.max_blocks,
+        min_block_len=2,
+        max_block_len=args.max_block_len,
+        min_gap=args.min_gap,
+    )
+
     for batch in loader:
-        x_clean = batch["x_clean"].to(device).unsqueeze(-1)  # (B, L, 1)
-        B = x_clean.shape[0]
+        x0_raw = batch["x_clean"].to(device).unsqueeze(-1)  # (B, L, 1)
+        B = x0_raw.shape[0]
+        rng = np.random.default_rng(int(torch.randint(0, 2**31 - 1, (1,)).item()))
+        mask_np = np.ones((B, args.seq_len), dtype=np.float32)
+        do_impute = rng.random(B) < float(args.impute_prob)
+        for i in range(B):
+            if do_impute[i]:
+                mask_np[i] = generate_missing_mask(args.seq_len, rng, mask_cfg, enforce_missing=True)
+        mask = torch.tensor(mask_np, device=device, dtype=torch.float32).unsqueeze(-1)
+
+        x0_np = x0_raw.squeeze(-1).detach().cpu().numpy()
+        amp = (x0_np.max(axis=1) - x0_np.min(axis=1))
+        u = rng.uniform(0.0, float(args.sigma_u_max), size=B)
+        sigma = (u * amp).astype(np.float32)
+        sigma_t = torch.tensor(sigma, device=device, dtype=torch.float32)
+        y = x0_raw + sigma_t.view(B, 1, 1) * torch.randn_like(x0_raw)
+        y_obs = y * mask
+
+        x0_norm_list = []
+        y_obs_norm_list = []
+        sigma_norm_list = []
+        for i in range(B):
+            y_i = y_obs[i].squeeze(-1).detach().cpu().numpy()
+            m_i = mask[i].squeeze(-1).detach().cpu().numpy()
+            y_norm_i, params = robust_normalize_masked(y_i, m_i)
+            x0_norm_i = apply_norm(x0_raw[i].squeeze(-1).detach().cpu().numpy(), params)
+            x0_norm_list.append(x0_norm_i)
+            y_obs_norm_list.append(y_norm_i * m_i)
+            sigma_norm_list.append(float(sigma[i]) * float(params.scale))
+
+        x_clean = torch.tensor(np.stack(x0_norm_list), device=device, dtype=torch.float32).unsqueeze(-1)
+        y_obs_n = torch.tensor(np.stack(y_obs_norm_list), device=device, dtype=torch.float32).unsqueeze(-1)
+        sigma_norm = torch.tensor(np.array(sigma_norm_list, dtype=np.float32), device=device)
+        sigma_log_hat = sigma_estimator(y_obs_n, mask)
         t = _sample_t(B, args.T, args.t_bias, device)
 
         # Gesamt-Loss
         loss, _, _ = scheduler.p_losses(
             model, x_clean, t,
-            noise_type=args.noise_type,
+            y_obs=y_obs_n,
+            mask=mask,
+            sigma_log=sigma_log_hat,
+            noise_type="gaussian",
             loss_type=args.loss_type,
             smoothness_weight=args.smoothness_weight,
         )
         total_loss += loss.item()
 
         # Per-Sample-Loss für Bucket-Analyse
-        x_t, noise = scheduler.q_sample(x_clean, t, noise_type=args.noise_type)
-        eps_hat     = model(x_t, t)
+        x_t, noise = scheduler.q_sample(x_clean, t, noise_type="gaussian")
+        eps_hat     = model(x_t, t, y_obs=y_obs_n, mask=mask, sigma_log=sigma_log_hat)
 
         if args.loss_type == "mse":
             per_sample = F.mse_loss(eps_hat, noise, reduction="none").mean(dim=(1, 2))
@@ -363,6 +490,7 @@ def save_denoising_preview(
 
 def save_checkpoint(
     model:     DiffusionTransformer,
+    sigma_estimator: SigmaEstimator,
     optimizer: torch.optim.Optimizer,
     epoch:     int,
     val_loss:  float,
@@ -373,6 +501,7 @@ def save_checkpoint(
         "epoch":       epoch,
         "val_loss":    val_loss,
         "model_state": model.state_dict(),
+        "sigma_state": sigma_estimator.state_dict(),
         "optim_state": optimizer.state_dict(),
         "args":        vars(args),
     }
@@ -382,10 +511,13 @@ def save_checkpoint(
 def load_checkpoint(
     path:      str,
     model:     DiffusionTransformer,
+    sigma_estimator: Optional[SigmaEstimator] = None,
     optimizer: Optional[torch.optim.Optimizer] = None,
 ) -> tuple[int, float]:
     state = torch.load(path, map_location="cpu", weights_only=False)
     model.load_state_dict(state["model_state"])
+    if sigma_estimator is not None and "sigma_state" in state:
+        sigma_estimator.load_state_dict(state["sigma_state"])
     if optimizer is not None and "optim_state" in state:
         optimizer.load_state_dict(state["optim_state"])
     print(f"  ✓ Checkpoint geladen: Epoche {state['epoch']}, Val-Loss {state['val_loss']:.6f}")
@@ -489,7 +621,7 @@ def main():
                               num_workers=0, pin_memory=True)
     print(f"  Train: {train_size} | Val: {val_size}")
 
-    # --- Modell ---
+    # --- Modelle ---
     model = DiffusionTransformer(
         seq_len=args.seq_len,
         d_model=args.d_model,
@@ -499,13 +631,19 @@ def main():
         time_emb_dim=args.time_emb,
         dropout=args.dropout,
     ).to(device)
+    sigma_estimator = SigmaEstimator(hidden=32).to(device)
     print(f"\nModell: {model.count_parameters():,} trainierbare Parameter")
+    print(f"SigmaEstimator: {sum(p.numel() for p in sigma_estimator.parameters() if p.requires_grad):,} trainierbare Parameter")
 
     # --- Noise Scheduler ---
     scheduler = NoiseScheduler(T=args.T, schedule_type=args.schedule).to(device)
 
     # --- Optimizer + LR-Scheduler ---
-    optimizer    = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer    = torch.optim.AdamW(
+        list(model.parameters()) + list(sigma_estimator.parameters()),
+        lr=args.lr,
+        weight_decay=1e-4,
+    )
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=1e-6
     )
@@ -514,7 +652,7 @@ def main():
     start_epoch   = 0
     best_val_loss = math.inf
     if args.resume is not None:
-        start_epoch, best_val_loss = load_checkpoint(args.resume, model, optimizer)
+        start_epoch, best_val_loss = load_checkpoint(args.resume, model, sigma_estimator, optimizer)
         start_epoch += 1
 
     # --- Training ---
@@ -536,9 +674,9 @@ def main():
         t0 = time.time()
 
         train_loss, train_noise, train_smooth, grad_norm = train_one_epoch(
-            model, scheduler, train_loader, optimizer, device, args
+            model, sigma_estimator, scheduler, train_loader, optimizer, device, args
         )
-        val_loss, b_losses = validate(model, scheduler, val_loader, device, args)
+        val_loss, b_losses = validate(model, sigma_estimator, scheduler, val_loader, device, args)
         lr_scheduler.step()
 
         train_losses.append(train_loss)
@@ -558,12 +696,12 @@ def main():
         # Bestes Modell
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            save_checkpoint(model, optimizer, epoch, val_loss, args, ckpt_dir / "best.pt")
+            save_checkpoint(model, sigma_estimator, optimizer, epoch, val_loss, args, ckpt_dir / "best.pt")
             print(f"  ★ Bestes Modell gespeichert (Val-Loss: {val_loss:.6f})")
 
         # Regelmäßige Checkpoints
         if (epoch + 1) % args.save_every == 0:
-            save_checkpoint(model, optimizer, epoch, val_loss, args,
+            save_checkpoint(model, sigma_estimator, optimizer, epoch, val_loss, args,
                             ckpt_dir / f"epoch_{epoch+1:04d}.pt")
 
         # Denoising-Vorschau

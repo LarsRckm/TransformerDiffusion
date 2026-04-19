@@ -204,6 +204,10 @@ class NoiseScheduler(nn.Module):
         model: nn.Module,
         x_0: torch.Tensor,
         t: torch.Tensor,
+        *,
+        y_obs: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+        sigma_log: Optional[torch.Tensor] = None,
         noise_type: NoiseType = "mixed",
         loss_type: Literal["mse", "huber"] = "huber",
         smoothness_weight: float = 0.0,
@@ -236,7 +240,7 @@ class NoiseScheduler(nn.Module):
         x_t, noise = self.q_sample(x_0, t, noise_type=noise_type)
 
         # Modell sagt Rauschen vorher
-        eps_hat = model(x_t, t)       # (B, L, 1)
+        eps_hat = model(x_t, t, y_obs=y_obs, mask=mask, sigma_log=sigma_log)  # (B, L, 1)
 
         # --- Rausch-Loss ---
         if loss_type == "mse":
