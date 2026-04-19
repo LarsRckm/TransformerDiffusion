@@ -113,7 +113,7 @@ def parse_args() -> argparse.Namespace:
                               "  verylow  – Bias auf [0, T/10)     (Micro Fine-Tuning)"))
 
     # Training
-    parser.add_argument("--epochs",     type=int,   default=100,      help="Trainings-Epochen")
+    parser.add_argument("--epochs",     type=int,   default=500,      help="Trainings-Epochen")
     parser.add_argument("--batch_size", type=int,   default=64,       help="Batch-Größe")
     parser.add_argument("--lr",         type=float, default=1e-4,     help="Lernrate")
     parser.add_argument("--eta_min",    type=float, default=1e-6,     help="Min. Lernrate (Cosine)")
