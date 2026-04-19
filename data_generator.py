@@ -426,6 +426,44 @@ class TrendDataset(Dataset):
         }
 
 
+class OnTheFlyTrendDataset(Dataset):
+    """Lazy/on-the-fly Dataset.
+
+    Generates a fresh synthetic clean trend in __getitem__ without precomputing
+    the full dataset in memory.
+
+    Note: For reproducibility and stable validation splits, the sample for a
+    given idx is deterministic (seed + idx). Diversity comes from large
+    n_samples and randomization inside the generators.
+    """
+
+    def __init__(
+        self,
+        n_samples: int = 10_000,
+        seq_len: int = 256,
+        trend_types: Optional[list[TrendType]] = None,
+        seed: int = 42,
+    ):
+        super().__init__()
+        self.n_samples = n_samples
+        self.seq_len = seq_len
+        self.trend_types = trend_types or ALL_TREND_TYPES
+        self.seed = int(seed)
+
+    def __len__(self) -> int:
+        return self.n_samples
+
+    def __getitem__(self, idx: int) -> dict:
+        rng = np.random.default_rng(self.seed + int(idx))
+        trend_type = rng.choice(self.trend_types)
+        # Randomize within each type
+        x_clean = generate_trend(trend_type, self.seq_len, rng)
+        return {
+            "x_clean": torch.from_numpy(x_clean.astype(np.float32)),
+            "trend_type": trend_type,
+        }
+
+
 # ---------------------------------------------------------------------------
 # Schnelltest / Vorschau
 # ---------------------------------------------------------------------------

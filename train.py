@@ -33,7 +33,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 
-from data_generator import TrendDataset, ALL_TREND_TYPES, generate_trend
+from data_generator import TrendDataset, OnTheFlyTrendDataset, ALL_TREND_TYPES, generate_trend
 from model import DiffusionTransformer, SigmaEstimator
 from noise_scheduler import NoiseScheduler
 from masking import MaskConfig, generate_missing_mask
@@ -53,6 +53,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq_len",     type=int,   default=1000,     help="Länge der Zeitreihe")
     parser.add_argument("--val_split",   type=float, default=0.1,      help="Anteil Validierungsdaten")
     parser.add_argument("--seed",        type=int,   default=42,       help="Zufallsseed")
+    parser.add_argument("--on_the_fly", action="store_true",
+                        help="Erzeugt Trainingsdaten on-the-fly (kein Pregenerate im RAM).")
 
     # Modell
     parser.add_argument("--d_model",    type=int,   default=128,      help="d-Dimension")
@@ -608,7 +610,10 @@ def main():
 
     # --- Datensatz ---
     print(f"\nErzeuge Datensatz: {args.n_samples} Samples, seq_len={args.seq_len} ...")
-    dataset    = TrendDataset(n_samples=args.n_samples, seq_len=args.seq_len, seed=args.seed)
+    if args.on_the_fly:
+        dataset = OnTheFlyTrendDataset(n_samples=args.n_samples, seq_len=args.seq_len, seed=args.seed)
+    else:
+        dataset = TrendDataset(n_samples=args.n_samples, seq_len=args.seq_len, seed=args.seed)
     val_size   = int(len(dataset) * args.val_split)
     train_size = len(dataset) - val_size
     train_ds, val_ds = random_split(
