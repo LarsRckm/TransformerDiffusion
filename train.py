@@ -97,9 +97,9 @@ def parse_args() -> argparse.Namespace:
     # Staged training (optional)
     parser.add_argument("--staged_training", action="store_true",
                         help="Aktiviert ein gestuftes Trainings-Schedule (Loss/Glattheit/Sigma-Gewicht).")
-    parser.add_argument("--stage1_epochs", type=int, default=100,
+    parser.add_argument("--stage1_epochs", type=int, default=80,
                         help="Epochen in Stage 1 (Default: MSE, smoothness=0)")
-    parser.add_argument("--stage2_epochs", type=int, default=0,
+    parser.add_argument("--stage2_epochs", type=int, default=60,
                         help="Epochen in Stage 2 (Default: Huber, smoothness>0)")
     parser.add_argument("--stage2_smoothness", type=float, default=0.02,
                         help="Smoothness-Gewicht in Stage 2/3")
