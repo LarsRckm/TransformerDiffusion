@@ -93,6 +93,18 @@ def parse_args() -> argparse.Namespace:
     # Sigma head loss
     parser.add_argument("--sigma_loss_weight", type=float, default=0.05,
                         help="Gewicht des Sigma-Schaetz-Loss")
+
+    # Staged training (optional)
+    parser.add_argument("--staged_training", action="store_true",
+                        help="Aktiviert ein gestuftes Trainings-Schedule (Loss/Glattheit/Sigma-Gewicht).")
+    parser.add_argument("--stage1_epochs", type=int, default=100,
+                        help="Epochen in Stage 1 (Default: MSE, smoothness=0)")
+    parser.add_argument("--stage2_epochs", type=int, default=0,
+                        help="Epochen in Stage 2 (Default: Huber, smoothness>0)")
+    parser.add_argument("--stage2_smoothness", type=float, default=0.02,
+                        help="Smoothness-Gewicht in Stage 2/3")
+    parser.add_argument("--stage3_sigma_loss_weight", type=float, default=0.15,
+                        help="Sigma-Loss-Gewicht ab Stage 3 (nach Stage2)")
     parser.add_argument("--t_bias",     type=str,   default="uniform",
                         choices=["uniform", "low", "verylow"],
                         help=("t-Sampling-Strategie:\n"
@@ -104,6 +116,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs",     type=int,   default=100,      help="Trainings-Epochen")
     parser.add_argument("--batch_size", type=int,   default=64,       help="Batch-Größe")
     parser.add_argument("--lr",         type=float, default=1e-4,     help="Lernrate")
+    parser.add_argument("--eta_min",    type=float, default=1e-6,     help="Min. Lernrate (Cosine)")
+    parser.add_argument("--warmup_epochs", type=int, default=0,
+                        help="Warmup-Epochen (0=aus). Linear auf --lr, dann Cosine.")
     parser.add_argument("--grad_clip",  type=float, default=1.0,      help="Gradient Clipping (0 = aus)")
 
     # Ausgabe
@@ -153,6 +168,10 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device:    torch.device,
     args:      argparse.Namespace,
+    *,
+    loss_type: str,
+    smoothness_weight: float,
+    sigma_loss_weight: float,
 ) -> tuple[float, float, float, float]:
     """
     Trainiert das Modell für eine Epoche.
@@ -229,12 +248,12 @@ def train_one_epoch(
             mask=mask,
             sigma_log=sigma_log_hat.detach(),
             noise_type="gaussian",
-            loss_type=args.loss_type,
-            smoothness_weight=args.smoothness_weight,
+            loss_type=loss_type,
+            smoothness_weight=smoothness_weight,
         )
 
         loss_sigma = F.smooth_l1_loss(sigma_log_hat, sigma_log_true)
-        loss = loss + float(args.sigma_loss_weight) * loss_sigma
+        loss = loss + float(sigma_loss_weight) * loss_sigma
 
         optimizer.zero_grad()
         loss.backward()
@@ -272,6 +291,9 @@ def validate(
     loader:    DataLoader,
     device:    torch.device,
     args:      argparse.Namespace,
+    *,
+    loss_type: str,
+    smoothness_weight: float,
 ) -> tuple[float, list[float]]:
     """
     Berechnet Validierungs-Loss gesamt und pro t-Bucket.
@@ -341,8 +363,8 @@ def validate(
             mask=mask,
             sigma_log=sigma_log_hat,
             noise_type="gaussian",
-            loss_type=args.loss_type,
-            smoothness_weight=args.smoothness_weight,
+            loss_type=loss_type,
+            smoothness_weight=smoothness_weight,
         )
         total_loss += loss.item()
 
@@ -350,7 +372,7 @@ def validate(
         x_t, noise = scheduler.q_sample(x_clean, t, noise_type="gaussian")
         eps_hat     = model(x_t, t, y_obs=y_obs_n, mask=mask, sigma_log=sigma_log_hat)
 
-        if args.loss_type == "mse":
+        if loss_type == "mse":
             per_sample = F.mse_loss(eps_hat, noise, reduction="none").mean(dim=(1, 2))
         else:
             per_sample = F.huber_loss(eps_hat, noise, reduction="none", delta=1.0).mean(dim=(1, 2))
@@ -611,19 +633,54 @@ def main():
     # --- Datensatz ---
     print(f"\nErzeuge Datensatz: {args.n_samples} Samples, seq_len={args.seq_len} ...")
     if args.on_the_fly:
-        dataset = OnTheFlyTrendDataset(n_samples=args.n_samples, seq_len=args.seq_len, seed=args.seed)
+        # On-the-fly: Train-Daten sollen pro Epoche neue Grundkurven enthalten.
+        # Daher:
+        #   - Val-Dataset ist fix (konstante Seeds) -> stabile Validierung
+        #   - Train-Dataset wird pro Epoche mit neuem Seed erzeugt
+        val_size = int(args.n_samples * args.val_split)
+        train_size = args.n_samples - val_size
+
+        val_ds = OnTheFlyTrendDataset(
+            n_samples=val_size,
+            seq_len=args.seq_len,
+            seed=args.seed + 999_983,  # fixer Offset
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True,
+        )
+
+        def make_train_loader(epoch: int) -> DataLoader:
+            # epoch-dependent seed -> neue Grundkurven pro Epoche
+            train_ds = OnTheFlyTrendDataset(
+                n_samples=train_size,
+                seq_len=args.seq_len,
+                seed=args.seed + (epoch * 1_000_003),
+            )
+            return DataLoader(
+                train_ds,
+                batch_size=args.batch_size,
+                shuffle=True,
+                num_workers=0,
+                pin_memory=True,
+            )
+
+        train_loader = make_train_loader(epoch=0)
     else:
         dataset = TrendDataset(n_samples=args.n_samples, seq_len=args.seq_len, seed=args.seed)
-    val_size   = int(len(dataset) * args.val_split)
-    train_size = len(dataset) - val_size
-    train_ds, val_ds = random_split(
-        dataset, [train_size, val_size],
-        generator=torch.Generator().manual_seed(args.seed),
-    )
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=0, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False,
-                              num_workers=0, pin_memory=True)
+        val_size   = int(len(dataset) * args.val_split)
+        train_size = len(dataset) - val_size
+        train_ds, val_ds = random_split(
+            dataset, [train_size, val_size],
+            generator=torch.Generator().manual_seed(args.seed),
+        )
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                                  num_workers=0, pin_memory=True)
+        val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False,
+                                  num_workers=0, pin_memory=True)
     print(f"  Train: {train_size} | Val: {val_size}")
 
     # --- Modelle ---
@@ -649,9 +706,30 @@ def main():
         lr=args.lr,
         weight_decay=1e-4,
     )
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=1e-6
-    )
+    # --- LR schedule: optional warmup + cosine ---
+    if args.warmup_epochs > 0:
+        warmup_epochs = int(args.warmup_epochs)
+        cosine_epochs = max(int(args.epochs) - warmup_epochs, 1)
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1e-8,
+            end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=cosine_epochs,
+            eta_min=float(args.eta_min),
+        )
+        lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup, cosine],
+            milestones=[warmup_epochs],
+        )
+    else:
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=float(args.eta_min)
+        )
 
     # --- Checkpoint fortsetzen ---
     start_epoch   = 0
@@ -678,10 +756,47 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
 
+        # On-the-fly: neue Grundkurven pro Epoche
+        if args.on_the_fly:
+            train_loader = make_train_loader(epoch)
+
+        # --- staged training (optional) ---
+        if args.staged_training:
+            s1 = int(args.stage1_epochs)
+            s2 = int(args.stage2_epochs)
+            if epoch < s1:
+                epoch_loss_type = "mse"
+                epoch_smooth = 0.0
+                epoch_sigma_w = float(args.sigma_loss_weight)
+                stage_name = "S1"
+            elif epoch < s1 + s2 and s2 > 0:
+                epoch_loss_type = "huber"
+                epoch_smooth = float(args.stage2_smoothness)
+                epoch_sigma_w = float(args.sigma_loss_weight)
+                stage_name = "S2"
+            else:
+                # Stage 3: keep Huber + smoothness, optionally increase sigma loss weight
+                epoch_loss_type = "huber" if s2 > 0 else "mse"
+                epoch_smooth = float(args.stage2_smoothness) if s2 > 0 else 0.0
+                epoch_sigma_w = float(args.stage3_sigma_loss_weight) if s2 > 0 else float(args.sigma_loss_weight)
+                stage_name = "S3"
+        else:
+            epoch_loss_type = args.loss_type
+            epoch_smooth = float(args.smoothness_weight)
+            epoch_sigma_w = float(args.sigma_loss_weight)
+            stage_name = ""
+
         train_loss, train_noise, train_smooth, grad_norm = train_one_epoch(
-            model, sigma_estimator, scheduler, train_loader, optimizer, device, args
+            model, sigma_estimator, scheduler, train_loader, optimizer, device, args,
+            loss_type=epoch_loss_type,
+            smoothness_weight=epoch_smooth,
+            sigma_loss_weight=epoch_sigma_w,
         )
-        val_loss, b_losses = validate(model, sigma_estimator, scheduler, val_loader, device, args)
+        val_loss, b_losses = validate(
+            model, sigma_estimator, scheduler, val_loader, device, args,
+            loss_type=epoch_loss_type,
+            smoothness_weight=epoch_smooth,
+        )
         lr_scheduler.step()
 
         train_losses.append(train_loss)
@@ -693,8 +808,9 @@ def main():
         lr_now  = optimizer.param_groups[0]["lr"]
 
         bucket_str = " | ".join(f"{bl:10.6f}" for bl in b_losses)
+        stage_tag = f" {stage_name}" if stage_name else ""
         print(
-            f"{epoch+1:8d} | {train_loss:10.6f} | {train_noise:10.6f} | {train_smooth:10.6f} | "
+            f"{epoch+1:8d}{stage_tag} | {train_loss:10.6f} | {train_noise:10.6f} | {train_smooth:10.6f} | "
             f"{val_loss:10.6f} | {grad_norm:9.4f} | {bucket_str}  [{elapsed:.1f}s, lr={lr_now:.1e}]"
         )
 

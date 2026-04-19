@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     # --- Checkpoint & Modell ---
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/epoch_0600.pt",
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/epoch_0080.pt",
                         help="Pfad zum Modell-Checkpoint")
 
     # --- Inferenz-Modus ---
